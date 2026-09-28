@@ -309,7 +309,7 @@ class DownloadServiceTest {
 	}
 
 	@Test
-	void search_ShouldOmitGpkgUnlessTheObjectExists() {
+	void search_ShouldListGpkgAvailableWhenWfsHasFeaturesEvenWithoutBucketObject() {
 		DownloadSearchRequest request = new DownloadSearchRequest();
 		request.setLevel2("DF");
 		when(downloadConfigService.getEnabledThemes()).thenReturn(List.of(areaTheme));
@@ -322,7 +322,8 @@ class DownloadServiceTest {
 
 		List<DownloadItemResponse> items = downloadService.search(request);
 
-		assertTrue(items.getFirst().formats().stream().noneMatch(format -> "gpkg".equals(format.format())));
+		assertTrue(items.getFirst().formats().stream().anyMatch(format ->
+				"gpkg".equals(format.format()) && DownloadFormatStatus.AVAILABLE.equals(format.status())));
 		assertTrue(items.getFirst().formats().stream().anyMatch(format ->
 				"csv".equals(format.format()) && DownloadFormatStatus.AVAILABLE.equals(format.status())));
 	}

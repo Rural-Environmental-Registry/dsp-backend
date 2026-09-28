@@ -76,16 +76,20 @@ public class DownloadService {
 			String cqlFilter = territoryFilterBuilder.buildCqlFilter(theme, level2, level3);
 			long matched = geoServerWfsClient.countFeatures(wfsBaseUrl, theme.typeName(), cqlFilter);
 			boolean available = matched > 0;
-			boolean gpkgPublished = themeDeclares(theme, GPKG_FORMAT)
+			boolean gpkgInBucket = themeDeclares(theme, GPKG_FORMAT)
 					&& preGeneratedGeoFileService.exists(level2, level3, theme.code(), GPKG_FORMAT);
 			List<DownloadFormatStatus> formats = theme.formats().stream()
-					.filter(format -> !isGpkg(format) || gpkgPublished)
-					.map(format -> new DownloadFormatStatus(
-							format,
-							isGpkg(format) || available
-									? DownloadFormatStatus.AVAILABLE
-									: DownloadFormatStatus.UNAVAILABLE
-					))
+					.map(format -> {
+						boolean formatAvailable = isGpkg(format)
+								? (available || gpkgInBucket)
+								: available;
+						return new DownloadFormatStatus(
+								format,
+								formatAvailable
+										? DownloadFormatStatus.AVAILABLE
+										: DownloadFormatStatus.UNAVAILABLE
+						);
+					})
 					.toList();
 			String lastUpdate = null;
 			if (available) {
