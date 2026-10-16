@@ -76,20 +76,13 @@ public class DownloadService {
 			String cqlFilter = territoryFilterBuilder.buildCqlFilter(theme, level2, level3);
 			long matched = geoServerWfsClient.countFeatures(wfsBaseUrl, theme.typeName(), cqlFilter);
 			boolean available = matched > 0;
-			boolean gpkgInBucket = themeDeclares(theme, GPKG_FORMAT)
-					&& preGeneratedGeoFileService.exists(level2, level3, theme.code(), GPKG_FORMAT);
 			List<DownloadFormatStatus> formats = theme.formats().stream()
-					.map(format -> {
-						boolean formatAvailable = isGpkg(format)
-								? (available || gpkgInBucket)
-								: available;
-						return new DownloadFormatStatus(
-								format,
-								formatAvailable
-										? DownloadFormatStatus.AVAILABLE
-										: DownloadFormatStatus.UNAVAILABLE
-						);
-					})
+					.map(format -> new DownloadFormatStatus(
+							format,
+							available
+									? DownloadFormatStatus.AVAILABLE
+									: DownloadFormatStatus.UNAVAILABLE
+					))
 					.toList();
 			String lastUpdate = null;
 			if (available) {
@@ -99,10 +92,12 @@ public class DownloadService {
 						cqlFilter
 				).orElse(null);
 			}
-			String lastFileGenerated = firstFormat(theme)
-					.flatMap(format -> preGeneratedGeoFileService.findGeneratedAt(
-							level2, level3, theme.code(), format))
-					.orElse(null);
+			String lastFileGenerated = available
+					? firstFormat(theme)
+							.flatMap(format -> preGeneratedGeoFileService.findGeneratedAt(
+									level2, level3, theme.code(), format))
+							.orElse(null)
+					: null;
 			items.add(new DownloadItemResponse(
 					theme.code(),
 					theme.name(),
@@ -134,6 +129,13 @@ public class DownloadService {
 		}
 
 		String normalizedLevel2 = level2.trim();
+
+		String wfsBaseUrl = downloadConfigService.resolveWfsBaseUrl();
+		String cqlFilter = territoryFilterBuilder.buildCqlFilter(themeConfig, normalizedLevel2, normalizedLevel3);
+		long matched = geoServerWfsClient.countFeatures(wfsBaseUrl, themeConfig.typeName(), cqlFilter);
+		if (matched <= 0) {
+			throw new ResponseStatusException(HttpStatus.NOT_FOUND, "File unavailable for download");
+		}
 
 		// S3-first: the file was already generated from the same base the WFS reads, so serving
 		// it skips the heavy query. Only the formats the WFS can produce have a fallback.
@@ -193,10 +195,6 @@ public class DownloadService {
 
 		String wfsBaseUrl = downloadConfigService.resolveWfsBaseUrl();
 		String cqlFilter = territoryFilterBuilder.buildCqlFilter(themeConfig, level2, level3);
-		long matched = geoServerWfsClient.countFeatures(wfsBaseUrl, themeConfig.typeName(), cqlFilter);
-		if (matched <= 0) {
-			throw new ResponseStatusException(HttpStatus.NOT_FOUND, "File unavailable for download");
-		}
 		if (isGpkg(format)) {
 			return geoServerWfsClient.downloadGpkg(wfsBaseUrl, themeConfig.typeName(), cqlFilter);
 		}
@@ -290,10 +288,6 @@ public class DownloadService {
 			throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Format not supported");
 		}
 		return normalized;
-	}
-
-	private static boolean themeDeclares(DownloadThemeConfig theme, String format) {
-		return theme.formats() != null && theme.formats().stream().anyMatch(candidate -> isFormat(candidate, format));
 	}
 
 	/** CSV and GeoPackage are the formats an area-of-interest bundle can carry. */
