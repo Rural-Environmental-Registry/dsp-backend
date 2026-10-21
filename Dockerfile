@@ -37,6 +37,7 @@ ARG DSP_BACKEND_PROJECT_NAME=dsp-backend
 ARG DSP_BACKEND_VERSION=0.0.1-SNAPSHOT
 
 RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends jq \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
