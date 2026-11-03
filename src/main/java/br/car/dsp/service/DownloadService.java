@@ -14,7 +14,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -22,9 +25,15 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class DownloadService {
+
+	/** Formats the WFS can produce, and therefore the only ones with a fallback. */
+	private static final Set<String> WFS_BACKED_FORMATS = Set.of("csv", "gpkg");
+
+	private static final String GPKG_FORMAT = "gpkg";
 
 	private final DownloadConfigService downloadConfigService;
 	private final DownloadTerritoryFilterBuilder territoryFilterBuilder;
@@ -32,6 +41,7 @@ public class DownloadService {
 	private final DownloadFileNameBuilder downloadFileNameBuilder;
 	private final AreaOfInterestRepository areaOfInterestRepository;
 	private final FeaturesBundleZipBuilder featuresBundleZipBuilder;
+	private final PreGeneratedGeoFileService preGeneratedGeoFileService;
 
 	public List<DownloadThemeResponse> getThemes() {
 		return downloadConfigService.getEnabledThemes().stream()
@@ -82,11 +92,18 @@ public class DownloadService {
 						cqlFilter
 				).orElse(null);
 			}
+			String lastFileGenerated = available
+					? firstFormat(theme)
+							.flatMap(format -> preGeneratedGeoFileService.findGeneratedAt(
+									level2, level3, theme.code(), format))
+							.orElse(null)
+					: null;
 			items.add(new DownloadItemResponse(
 					theme.code(),
 					theme.name(),
 					formats,
-					lastUpdate
+					lastUpdate,
+					lastFileGenerated
 			));
 		}
 		return items;
@@ -111,27 +128,48 @@ public class DownloadService {
 			throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Format not supported for the theme");
 		}
 
-		String cqlFilter = territoryFilterBuilder.buildCqlFilter(
-				themeConfig,
-				level2.trim(),
-				normalizedLevel3
-		);
-		long matched = geoServerWfsClient.countFeatures(
-				downloadConfigService.resolveWfsBaseUrl(),
-				themeConfig.typeName(),
-				cqlFilter
-		);
+		String normalizedLevel2 = level2.trim();
+
+		String wfsBaseUrl = downloadConfigService.resolveWfsBaseUrl();
+		String cqlFilter = territoryFilterBuilder.buildCqlFilter(themeConfig, normalizedLevel2, normalizedLevel3);
+		long matched = geoServerWfsClient.countFeatures(wfsBaseUrl, themeConfig.typeName(), cqlFilter);
 		if (matched <= 0) {
 			throw new ResponseStatusException(HttpStatus.NOT_FOUND, "File unavailable for download");
 		}
 
-		byte[] content = geoServerWfsClient.downloadCsv(
-				downloadConfigService.resolveWfsBaseUrl(),
-				themeConfig.typeName(),
-				cqlFilter
+		// S3-first: the file was already generated from the same base the WFS reads, so serving
+		// it skips the heavy query. Only the formats the WFS can produce have a fallback.
+		Optional<byte[]> preGenerated = preGeneratedGeoFileService.fetch(
+				normalizedLevel2,
+				normalizedLevel3,
+				themeConfig.code(),
+				normalizedFormat
 		);
+		byte[] content;
+		if (preGenerated.isPresent()) {
+			content = preGenerated.get();
+			log.info(
+					"Download served from S3 | level2={} level3={} theme={} format={} bytes={}",
+					normalizedLevel2,
+					normalizedLevel3,
+					themeConfig.code(),
+					normalizedFormat,
+					content.length
+			);
+		} else {
+			content = downloadFromWfs(themeConfig, normalizedLevel2, normalizedLevel3, normalizedFormat);
+			log.info(
+					"Download served from WFS | level2={} level3={} theme={} format={} bytes={}",
+					normalizedLevel2,
+					normalizedLevel3,
+					themeConfig.code(),
+					normalizedFormat,
+					content.length
+			);
+		}
+
 		String fileName = downloadFileNameBuilder.build(
-				level2.trim(),
+				normalizedLevel2,
 				normalizedLevel3,
 				themeConfig.name(),
 				normalizedFormat
@@ -145,11 +183,44 @@ public class DownloadService {
 		return new ResponseEntity<>(content, headers, HttpStatus.OK);
 	}
 
-	public ResponseEntity<byte[]> downloadFeaturesBundle(String aoiId) {
+	/**
+	 * Fallback for what the object storage does not have. {@code csv} and {@code gpkg} exist in
+	 * the WFS; any other format is served exclusively from the pre-generated file.
+	 */
+	private byte[] downloadFromWfs(DownloadThemeConfig themeConfig, String level2, String level3,
+			String format) {
+		if (!WFS_BACKED_FORMATS.contains(format)) {
+			throw new ResponseStatusException(HttpStatus.NOT_FOUND, "File unavailable for download");
+		}
+
+		String wfsBaseUrl = downloadConfigService.resolveWfsBaseUrl();
+		String cqlFilter = territoryFilterBuilder.buildCqlFilter(themeConfig, level2, level3);
+		if (isGpkg(format)) {
+			return geoServerWfsClient.downloadGpkg(wfsBaseUrl, themeConfig.typeName(), cqlFilter);
+		}
+		return geoServerWfsClient.downloadCsv(wfsBaseUrl, themeConfig.typeName(), cqlFilter);
+	}
+
+	/**
+	 * First format of the theme: enough to HeadObject the published file for {@code lastFileGenerated}.
+	 *
+	 * <p>{@code rer-dsp-job-geo-file-generation} publishes every format of a theme/territory in the
+	 * same run, so their {@code generated-at} metadata is always the same — checking one format is
+	 * equivalent to checking all of them, without the extra HeadObject calls.
+	 */
+	private static Optional<String> firstFormat(DownloadThemeConfig theme) {
+		List<String> formats = theme.formats();
+		return formats == null || formats.isEmpty()
+				? Optional.empty()
+				: Optional.of(formats.getFirst());
+	}
+
+	public ResponseEntity<byte[]> downloadFeaturesBundle(String aoiId, String format) {
 		String normalizedAoiId = blankToNull(aoiId);
 		if (normalizedAoiId == null) {
 			throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Area of interest id is required");
 		}
+		String normalizedFormat = normalizeBundleFormat(format);
 		if (!areaOfInterestRepository.existsById(normalizedAoiId)) {
 			throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Area of interest not found");
 		}
@@ -158,7 +229,10 @@ public class DownloadService {
 		Map<String, byte[]> entries = new LinkedHashMap<>();
 
 		for (DownloadThemeConfig theme : downloadConfigService.getEnabledThemes()) {
-			if (!theme.formats().contains("csv")) {
+			List<String> bundleFormats = bundleFormats(theme).stream()
+					.filter(candidate -> isFormat(candidate, normalizedFormat))
+					.toList();
+			if (bundleFormats.isEmpty()) {
 				continue;
 			}
 
@@ -168,9 +242,14 @@ public class DownloadService {
 				continue;
 			}
 
-			byte[] content = geoServerWfsClient.downloadCsv(wfsBaseUrl, theme.typeName(), cqlFilter);
-			String entryName = downloadFileNameBuilder.buildForAoi(normalizedAoiId, theme.name(), "csv");
-			entries.put(entryName, content);
+			for (String entryFormat : bundleFormats) {
+				byte[] content = isGpkg(entryFormat)
+						? geoServerWfsClient.downloadGpkg(wfsBaseUrl, theme.typeName(), cqlFilter)
+						: geoServerWfsClient.downloadCsv(wfsBaseUrl, theme.typeName(), cqlFilter);
+				String entryName = downloadFileNameBuilder.buildForAoi(
+						normalizedAoiId, theme.name(), entryFormat);
+				entries.put(entryName, content);
+			}
 		}
 
 		if (entries.isEmpty()) {
@@ -198,6 +277,35 @@ public class DownloadService {
 		headers.setContentLength(zipBytes.length);
 
 		return new ResponseEntity<>(zipBytes, headers, HttpStatus.OK);
+	}
+
+	private static String normalizeBundleFormat(String format) {
+		if (format == null || format.isBlank()) {
+			throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Format is required");
+		}
+		String normalized = format.trim().toLowerCase(Locale.ROOT);
+		if (!WFS_BACKED_FORMATS.contains(normalized)) {
+			throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Format not supported");
+		}
+		return normalized;
+	}
+
+	/** CSV and GeoPackage are the formats an area-of-interest bundle can carry. */
+	private static List<String> bundleFormats(DownloadThemeConfig theme) {
+		if (theme.formats() == null) {
+			return List.of();
+		}
+		return theme.formats().stream()
+				.filter(format -> isFormat(format, "csv") || isGpkg(format))
+				.toList();
+	}
+
+	private static boolean isGpkg(String format) {
+		return isFormat(format, GPKG_FORMAT);
+	}
+
+	private static boolean isFormat(String format, String expected) {
+		return format != null && expected.equalsIgnoreCase(format.trim());
 	}
 
 	private static String blankToNull(String value) {
