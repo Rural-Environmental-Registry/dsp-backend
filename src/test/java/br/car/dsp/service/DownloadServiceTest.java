@@ -234,6 +234,11 @@ class DownloadServiceTest {
 	@Test
 	void downloadFile_ShouldServePreGeneratedFileWithoutTouchingTheWfs() {
 		when(downloadConfigService.findEnabledTheme("area_of_interest")).thenReturn(java.util.Optional.of(areaTheme));
+		when(downloadConfigService.resolveWfsBaseUrl()).thenReturn("http://localhost:22669/geoserver/dsp/wfs");
+		when(territoryFilterBuilder.buildCqlFilter(areaTheme, "DF", null))
+				.thenReturn("territory_level_3_id IN ('5300108')");
+		when(geoServerWfsClient.countFeatures(anyString(), eq("dsp:area-of-interest"), anyString()))
+				.thenReturn(1L);
 		when(preGeneratedGeoFileService.fetch("DF", null, "area_of_interest", "csv"))
 				.thenReturn(java.util.Optional.of("id,name\n1,pre-generated\n".getBytes()));
 		when(downloadFileNameBuilder.build("DF", null, "Area of interest", "csv"))
@@ -244,7 +249,7 @@ class DownloadServiceTest {
 		assertEquals(HttpStatus.OK, response.getStatusCode());
 		assertEquals("id,name\n1,pre-generated\n", new String(response.getBody()));
 		verify(geoServerWfsClient, never()).downloadCsv(anyString(), anyString(), anyString());
-		verify(geoServerWfsClient, never()).countFeatures(anyString(), anyString(), anyString());
+		verify(geoServerWfsClient).countFeatures(anyString(), eq("dsp:area-of-interest"), anyString());
 	}
 
 	@Test
@@ -318,7 +323,6 @@ class DownloadServiceTest {
 				.thenReturn("territory_level_3_id IN ('5300108')");
 		when(geoServerWfsClient.countFeatures(anyString(), eq("dsp:area-of-interest"), anyString()))
 				.thenReturn(2L);
-		when(preGeneratedGeoFileService.exists("DF", null, "area_of_interest", "gpkg")).thenReturn(false);
 
 		List<DownloadItemResponse> items = downloadService.search(request);
 
@@ -329,7 +333,7 @@ class DownloadServiceTest {
 	}
 
 	@Test
-	void search_ShouldListGpkgWhenTheObjectExistsEvenIfTheCutIsEmpty() {
+	void search_ShouldListFormatsUnavailableWhenTheCutIsEmptyEvenIfGpkgIsInTheBucket() {
 		DownloadSearchRequest request = new DownloadSearchRequest();
 		request.setLevel2("DF");
 		when(downloadConfigService.getEnabledThemes()).thenReturn(List.of(areaTheme));
@@ -338,14 +342,29 @@ class DownloadServiceTest {
 				.thenReturn("territory_level_3_id IN ('')");
 		when(geoServerWfsClient.countFeatures(anyString(), eq("dsp:area-of-interest"), anyString()))
 				.thenReturn(0L);
-		when(preGeneratedGeoFileService.exists("DF", null, "area_of_interest", "gpkg")).thenReturn(true);
 
 		List<DownloadItemResponse> items = downloadService.search(request);
 
-		assertTrue(items.getFirst().formats().stream().anyMatch(format ->
-				"gpkg".equals(format.format()) && DownloadFormatStatus.AVAILABLE.equals(format.status())));
-		assertTrue(items.getFirst().formats().stream().anyMatch(format ->
-				"csv".equals(format.format()) && DownloadFormatStatus.UNAVAILABLE.equals(format.status())));
+		assertTrue(items.getFirst().formats().stream().allMatch(format ->
+				DownloadFormatStatus.UNAVAILABLE.equals(format.status())));
+		assertNull(items.getFirst().lastFileGenerated());
+	}
+
+	@Test
+	void downloadFile_ShouldReturnNotFoundWhenPreGeneratedExistsButTheCutIsEmpty() {
+		when(downloadConfigService.findEnabledTheme("area_of_interest")).thenReturn(java.util.Optional.of(areaTheme));
+		when(downloadConfigService.resolveWfsBaseUrl()).thenReturn("http://localhost:22669/geoserver/dsp/wfs");
+		when(territoryFilterBuilder.buildCqlFilter(areaTheme, "DF", null))
+				.thenReturn("territory_level_3_id IN ('')");
+		when(geoServerWfsClient.countFeatures(anyString(), eq("dsp:area-of-interest"), anyString()))
+				.thenReturn(0L);
+
+		ResponseStatusException exception = assertThrows(
+				ResponseStatusException.class,
+				() -> downloadService.downloadFile("DF", null, "area_of_interest", "gpkg")
+		);
+
+		assertEquals(HttpStatus.NOT_FOUND, exception.getStatusCode());
 	}
 
 	@Test
