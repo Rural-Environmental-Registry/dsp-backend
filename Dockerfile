@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/root/.gradle/caches \
 ARG DSP_BACKEND_PROJECT_NAME=dsp-backend
 ARG DSP_BACKEND_VERSION=0.0.1-SNAPSHOT
 
-FROM eclipse-temurin:21-jre-jammy AS runtime
+FROM eclipse-temurin:21.0.13.1_2-jre-jammy AS runtime
 WORKDIR /app
 
 ARG DSP_BACKEND_PROJECT_NAME=dsp-backend
